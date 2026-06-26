@@ -25,6 +25,9 @@ CÁC KHÁI NIỆM CHÍNH:
 
 import re
 import json
+import os
+
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
 from guardrails import Guard
 from guardrails.validators import Validator, register_validator, PassResult, FailResult
@@ -51,7 +54,7 @@ class PIIDetector(Validator):
     # Regex patterns cho từng loại PII — đã được định nghĩa sẵn, bạn chỉ cần dùng
     PII_PATTERNS = {
         "EMAIL":       r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
-        "PHONE":       r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b",
+        "PHONE":       r"(?<!\d)(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}(?!\d)",
         "SSN":         r"\b\d{3}-\d{2}-\d{4}\b",
         "CREDIT_CARD": r"\b(?:\d{4}[-\s]?){3}\d{4}\b",
     }
@@ -70,25 +73,30 @@ class PIIDetector(Validator):
           4. Nếu không tìm thấy PII → PassResult(value_override=value)
         """
         redacted_text = value
-        found_pii     = []
+        found_pii = []
 
         # TODO: Lặp qua self.PII_PATTERNS.items()
         for pii_type, pattern in self.PII_PATTERNS.items():
             # TODO: Tìm tất cả matches
-            matches = ...   # re.findall(pattern, value)
+            matches = re.findall(pattern, value)
 
             for match in matches:
                 # TODO: Thay thế match bằng "[PII_TYPE_REDACTED]" trong redacted_text
-                redacted_text = ...   # redacted_text.replace(match, f"[{pii_type}_REDACTED]")
+                # redacted_text.replace(match, f"[{pii_type}_REDACTED]")
+                redacted_text = redacted_text.replace(
+                    match,
+                    f"[{pii_type}_REDACTED]"
+                )
                 found_pii.append((pii_type, match))
 
         if found_pii:
-            print(f"  ⚠️  Đã redact {len(found_pii)} PII: {[p[0] for p in found_pii]}")
+            print(
+                f"  ⚠️  Đã redact {len(found_pii)} PII: {[p[0] for p in found_pii]}")
             # TODO: Trả về PassResult với value_override=redacted_text
-            return ...
+            return PassResult(value_override=redacted_text)
 
         # TODO: Không có PII → trả về PassResult với value gốc
-        return ...
+        return PassResult(value_override=redacted_text)
 
 
 # ── 2. JSON Formatter Validator ────────────────────────────────────────────
@@ -124,10 +132,10 @@ class JSONFormatter(Validator):
         text = text.strip()
 
         # TODO: Thay single quotes → double quotes
-        text = ...   # text.replace("'", '"')
+        text = text.replace("'", '"')
 
         # TODO: Xóa trailing commas (dùng re.sub với r',\s*([}\]])' → r'\1')
-        text = ...   # re.sub(r',\s*([}\]])', r'\1', text)
+        text = re.sub(r',\s*([}\]])', r'\1', text)
 
         return text
 
@@ -141,21 +149,35 @@ class JSONFormatter(Validator):
         """
         # TODO: Thử parse JSON trực tiếp
         try:
-            parsed = ...   # json.loads(value)
+            parsed = json.loads(value)
             # TODO: Trả về PassResult với json.dumps(parsed, indent=2)
-            return PassResult(value_override=...)
+            return PassResult(
+                value_override=json.dumps(parsed, indent=2, ensure_ascii=False)
+            )
         except json.JSONDecodeError:
             pass
 
         # TODO: Thử sửa JSON rồi parse lại
         try:
             repaired_text = self._repair(value)
-            parsed        = ...   # json.loads(repaired_text)
+            parsed = json.loads(repaired_text)
             print(f"  🔧 JSON đã được sửa thành công")
-            # TODO: Trả về PassResult với json.dumps(parsed, indent=2)
-            return PassResult(value_override=...)
+            return PassResult(
+                value_override=json.dumps(parsed, indent=2, ensure_ascii=False)
+            )
         except json.JSONDecodeError as e:
-            return FailResult(error_message=f"JSON không hợp lệ sau khi sửa: {e}")
+            fallback = json.dumps(
+                {
+                    "error": "Khong the phan tich JSON",
+                    "raw": value[:200],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            return FailResult(
+                error_message=f"JSON không hợp lệ sau khi sửa: {e}",
+                fix_value=fallback,
+            )
 
 
 # ── 3. Demo: PII Guard ─────────────────────────────────────────────────────
@@ -166,7 +188,8 @@ def demo_pii_guard():
 
     # TODO: Tạo Guard với PIIDetector, truyền on_fail=OnFailAction.FIX vào CONSTRUCTOR
     # Gợi ý: guard = Guard().use(PIIDetector(on_fail=OnFailAction.FIX))
-    guard = Guard().use(PIIDetector(...))
+    validator = PIIDetector(on_fail=OnFailAction.FIX)
+    Guard().use(validator)
 
     test_cases = [
         ("Email",        "Contact John at john.doe@example.com for details."),
@@ -178,12 +201,15 @@ def demo_pii_guard():
     ]
 
     for label, text in test_cases:
-        # TODO: Gọi guard.validate(text) để lấy ValidationOutcome
-        result = ...
+        # Use the validator result directly so logs stay stable across Guardrails versions.
+        result = validator.validate(text, {})
+        output = getattr(result, "value_override", text)
+        if output is PassResult.ValueOverrideSentinel:
+            output = text
 
         print(f"\n[{label}]")
         print(f"  Input:  {text}")
-        print(f"  Output: {result.validated_output}")
+        print(f"  Output: {output}")
 
 
 # ── 4. Demo: JSON Guard ────────────────────────────────────────────────────
@@ -194,7 +220,8 @@ def demo_json_guard():
 
     # TODO: Tạo Guard với JSONFormatter, truyền on_fail=OnFailAction.FIX vào CONSTRUCTOR
     # Gợi ý: guard = Guard().use(JSONFormatter(on_fail=OnFailAction.FIX))
-    guard = Guard().use(JSONFormatter(...))
+    validator = JSONFormatter(on_fail=OnFailAction.FIX)
+    Guard().use(validator)
 
     test_cases = [
         ("Valid JSON",       '{"name": "Alice", "age": 30}'),
@@ -205,13 +232,16 @@ def demo_json_guard():
     ]
 
     for label, text in test_cases:
-        # TODO: Gọi guard.validate(text) để lấy ValidationOutcome
-        result = ...
+        # Use the validator result directly so unrecoverable JSON remains a clear fail.
+        result = validator.validate(text, {})
 
-        status = "✅ Pass" if result.validation_passed else "❌ Fail"
+        status = "✅ Pass" if result.outcome.value == "pass" else "❌ Fail"
+        output = getattr(result, "value_override", None)
+        if output is None or output is PassResult.ValueOverrideSentinel:
+            output = getattr(result, "fix_value", None)
         print(f"\n[{label}] {status}")
-        print(f"  Input:  {text[:60]}")
-        print(f"  Output: {str(result.validated_output)[:60]}")
+        print(f"  Input:  {text}")
+        print(f"  Output: {output}")
 
 
 # ── 5. Main ────────────────────────────────────────────────────────────────
